@@ -3,6 +3,9 @@ use std::io::Read;
 use std::io::Write;
 use std::io::{self};
 use std::net::SocketAddr;
+use tokio::sync::oneshot;
+use anyhow::{Context, Result};
+use super::ServerOptions;
 use std::net::TcpStream;
 use std::path::Path;
 use std::path::PathBuf;
@@ -23,6 +26,7 @@ use tiny_http::Header;
 use tiny_http::Request;
 use tiny_http::Response;
 use tiny_http::Server;
+
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_PORT: u16 = 1455;
@@ -614,3 +618,129 @@ async fn obtain_api_key(issuer: &str, client_id: &str, id_token: &str) -> io::Re
     let body: ExchangeResp = resp.json().await.map_err(io::Error::other)?;
     Ok(body.access_token)
 }
+
+/// New: how the login web server should behave.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServerMode {
+    /// Current behavior: bind localhost and receive the OAuth redirect.
+    Localhost,
+    /// Headless / remote: do NOT bind any port; caller must complete login another way.
+    Disabled,
+}
+
+/// What we send back to the login flow caller when the server receives the callback.
+#[derive(Debug)]
+pub struct LoginCode {
+    pub code: String,
+    pub state: String,
+}
+
+/// Result returned by `start_server`: either we spawned a local server (with a receiver),
+/// or we are disabled and nothing is listening.
+pub enum ServerHandle {
+    Listening {
+        addr: SocketAddr,
+        done_rx: oneshot::Receiver<Result<LoginCode>>,
+    },
+    Disabled,
+}
+
+/// Print headless instructions once, nice and short.
+/// Caller can decide to show this only in `Disabled` mode.
+pub fn print_headless_instructions(auth_url: &str) {
+    eprintln!("\nOpen this URL in any browser:\n{}\n", auth_url);
+    eprintln!("Headless/remote tips:");
+    eprintln!("  • SSH tunnel:  ssh -N -L 127.0.0.1:1455:127.0.0.1:1455 <user@host>");
+    eprintln!("  • Or use your IDE’s port forward (codespaces/code-server).");
+    eprintln!("Press Ctrl+C to cancel.\n");
+}
+
+/// Start the tiny HTTP server that captures `code` + `state` from the OAuth redirect.
+/// If `mode == Disabled`, we skip binding entirely and return `ServerHandle::Disabled`.
+pub async fn start_server(mode: ServerMode, port: u16) -> Result<ServerHandle> {
+    if mode == ServerMode::Disabled {
+        // No binding. The caller will either poll an out-of-band flow, or wait
+        // for a device-style login once available.
+        return Ok(ServerHandle::Disabled);
+    }
+
+    // --- existing code path below here ---
+    use hyper::service::{make_service_fn, service_fn};
+    use hyper::{Body, Request, Response, Server};
+    use std::convert::Infallible;
+    use url::Url;
+
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let (done_tx, done_rx) = oneshot::channel::<Result<LoginCode>>();
+
+    // tiny handler: parses query string, sends code+state back through oneshot.
+    let make_svc = make_service_fn(move |_| {
+        let done_tx = done_tx.clone();
+        async move {
+            Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
+                let done_tx = done_tx.clone();
+                async move {
+                    let response = match Url::parse(&format!("http://localhost{}", req.uri()))
+                        .ok()
+                        .and_then(|u| {
+                            let mut code = None::<String>;
+                            let mut state = None::<String>;
+                            for (k, v) in u.query_pairs() {
+                                match k.as_ref() {
+                                    "code" => code = Some(v.into_owned()),
+                                    "state" => state = Some(v.into_owned()),
+                                    _ => {}
+                                }
+                            }
+                            match (code, state) {
+                                (Some(code), Some(state)) => Some(LoginCode { code, state }),
+                                _ => None,
+                            }
+                        }) {
+                        Some(login) => {
+                            let _ = done_tx.send(Ok(login));
+                            Response::new(Body::from("Login complete. You can close this tab."))
+                        }
+                        None => {
+                            // malformed; show a minimal message
+                            Response::new(Body::from("Missing `code` or `state`."))
+                        }
+                    };
+                    Ok::<_, Infallible>(response)
+                }
+            }))
+        }
+    });
+
+    let server = Server::try_bind(&addr)
+        .with_context(|| format!("failed to bind localhost callback on {}", addr))?
+        .serve(make_svc);
+
+    // Run the server concurrently; when oneshot resolves, we shut down.
+    let graceful = server.with_graceful_shutdown(async {
+        // resolve when we receive code, or when process is cancelled
+        let _ = done_rx.closed();
+    });
+
+    // Spawn in the background; the caller awaits `done_rx` to get the code/state.
+    tokio::spawn(graceful);
+
+    Ok(ServerHandle::Listening { addr, done_rx })
+}
+
+/// Helper for callers that want a synchronous-ish await for the login code.
+/// If the server is disabled, this returns an error immediately so the caller can
+/// switch to headless flow (polling or device-style).
+pub async fn wait_for_code(handle: ServerHandle) -> Result<LoginCode> {
+    match handle {
+        ServerHandle::Listening { mut done_rx, .. } => {
+            done_rx
+                .await
+                .context("login server aborted before receiving callback")?
+        }
+        ServerHandle::Disabled => {
+            anyhow::bail!("login server disabled; no localhost callback available")
+        }
+    }
+}
+
